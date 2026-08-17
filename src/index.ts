@@ -13,14 +13,19 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, copyFileSync, unl
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 import { createConnection, Socket } from 'net';
+import { randomUUID } from 'crypto';
+import { createServer as createHttpServer } from 'http';
+import type { IncomingMessage, ServerResponse } from 'http';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ErrorCode,
   ListToolsRequestSchema,
   McpError,
+  isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js';
 
 import {
@@ -40,6 +45,14 @@ import {
   collectGdPaths,
   type OperationParams,
 } from './utils.js';
+import {
+  RuntimeLease,
+  classifyGodotStderr,
+  injectAutoloadEntry,
+  revertAutoloadEntry,
+  resolveGodotDisplayDriver,
+  type AutoloadInjection,
+} from './runtimeSupport.js';
 
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
@@ -72,7 +85,7 @@ const __dirname = dirname(__filename);
 interface GodotProcess {
   process: any;
   output: string[];
-  errors: string[];
+  stderr: string[];
 }
 
 /**
@@ -83,6 +96,7 @@ interface GodotServerConfig {
   debugMode?: boolean;
   godotDebugMode?: boolean;
   strictPathValidation?: boolean; // New option to control path validation behavior
+  manageProcessSignals?: boolean;
 }
 
 /**
@@ -94,8 +108,14 @@ interface GameConnection {
   responseBuffer: string;
   pendingRequests: Map<number, (value: any) => void>;
   projectPath: string | null;
-  interactionServerInjectedByUs: boolean;
+  interactionInjection: AutoloadInjection | null;
+  interactionScriptCreatedByUs: boolean;
 }
+
+// The injected game bridge listens on one fixed loopback port. A process-wide
+// lease is therefore required: per-session GodotServer instances alone do not
+// isolate HTTP sessions from each other's runtime.
+const sharedRuntimeLease = new RuntimeLease();
 
 /**
  * Main server class for the Godot MCP server
@@ -115,10 +135,14 @@ class GodotServer {
     responseBuffer: '',
     pendingRequests: new Map(),
     projectPath: null,
-    interactionServerInjectedByUs: false,
+    interactionInjection: null,
+    interactionScriptCreatedByUs: false,
   };
+  private readonly runtimeOwnerId = randomUUID();
+  private gameReconnectPromise: Promise<void> | null = null;
   private nextRequestId: number = 1;
   private lastErrorIndex: number = 0;
+  private lastWarningIndex: number = 0;
   private lastLogIndex: number = 0;
   private readonly INTERACTION_PORT = 9090;
   private readonly AUTOLOAD_NAME = 'McpInteractionServer';
@@ -178,11 +202,17 @@ class GodotServer {
     // Error handling
     this.server.onerror = (error) => console.error('[MCP Error]', error);
 
-    // Cleanup on exit
-    process.on('SIGINT', async () => {
-      await this.cleanup();
-      process.exit(0);
-    });
+    // Cleanup on exit for the standalone stdio process.
+    // HTTP mode manages process signals centrally because one Node process may host
+    // multiple protocol sessions.
+    if (config?.manageProcessSignals !== false) {
+      const shutdown = async () => {
+        await this.cleanup();
+        process.exit(0);
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+    }
   }
 
   /**
@@ -369,34 +399,40 @@ class GodotServer {
 
     const existingContent = readFileSync(projectFile, 'utf8');
     if (existingContent.includes(this.AUTOLOAD_NAME)) {
-      this.gameConnection.interactionServerInjectedByUs = false;
       if (!existsSync(destScript)) {
-        copyFileSync(this.interactionScriptPath, destScript);
-        this.logDebug(`Autoload present but script missing; restored ${destScript}`);
-      } else {
-        this.logDebug('Interaction server autoload and script already present; leaving project untouched');
+        throw new Error(
+          `Project declares ${this.AUTOLOAD_NAME}, but ${destScript} is missing. ` +
+          'Refusing to mutate a user-managed integration.'
+        );
       }
+      this.gameConnection.interactionInjection = null;
+      this.gameConnection.interactionScriptCreatedByUs = false;
+      this.logDebug('Interaction server autoload and script already present; leaving project untouched');
       return;
     }
 
-    this.gameConnection.interactionServerInjectedByUs = true;
-
-    copyFileSync(this.interactionScriptPath, destScript);
-    this.logDebug(`Copied interaction server script to ${destScript}`);
-
-    let content = existingContent;
-
-    const autoloadLine = `${this.AUTOLOAD_NAME}="*res://mcp_interaction_server.gd"`;
-
-    if (content.includes('[autoload]')) {
-      // Add after existing [autoload] section header
-      content = content.replace('[autoload]', `[autoload]\n\n${autoloadLine}`);
-    } else {
-      // Add new [autoload] section at end
-      content += `\n[autoload]\n\n${autoloadLine}\n`;
+    if (existsSync(destScript)) {
+      throw new Error(
+        `${destScript} already exists without the ${this.AUTOLOAD_NAME} autoload. ` +
+        'Refusing to overwrite a project file.'
+      );
     }
 
-    writeFileSync(projectFile, content, 'utf8');
+    const autoloadLine = `${this.AUTOLOAD_NAME}="*res://mcp_interaction_server.gd"`;
+    const injection = injectAutoloadEntry(existingContent, autoloadLine);
+
+    copyFileSync(this.interactionScriptPath, destScript);
+    this.gameConnection.interactionScriptCreatedByUs = true;
+    this.logDebug(`Copied interaction server script to ${destScript}`);
+
+    try {
+      writeFileSync(projectFile, injection.instrumentedContent, 'utf8');
+      this.gameConnection.interactionInjection = injection;
+    } catch (error) {
+      unlinkSync(destScript);
+      this.gameConnection.interactionScriptCreatedByUs = false;
+      throw error;
+    }
     this.logDebug(`Injected ${this.AUTOLOAD_NAME} autoload into project.godot`);
   }
 
@@ -404,34 +440,32 @@ class GodotServer {
    * Remove the interaction server script and autoload from the project
    */
   private removeInteractionServer(projectPath: string): void {
-    if (!this.gameConnection.interactionServerInjectedByUs) {
+    const injection = this.gameConnection.interactionInjection;
+    const scriptCreatedByUs = this.gameConnection.interactionScriptCreatedByUs;
+    if (!injection && !scriptCreatedByUs) {
       this.logDebug('Interaction server was user-managed; skipping cleanup');
       return;
     }
-    this.gameConnection.interactionServerInjectedByUs = false;
+    this.gameConnection.interactionInjection = null;
+    this.gameConnection.interactionScriptCreatedByUs = false;
 
     const projectFile = join(projectPath, 'project.godot');
     const destScript = join(projectPath, 'mcp_interaction_server.gd');
 
-    // Remove autoload line from project.godot
-    if (existsSync(projectFile)) {
-      let content = readFileSync(projectFile, 'utf8');
-      // Remove the autoload line (and any surrounding blank line)
-      const autoloadLine = `${this.AUTOLOAD_NAME}="*res://mcp_interaction_server.gd"`;
-      content = content.replace(new RegExp(`\\n?${autoloadLine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n?`), '\n');
-      writeFileSync(projectFile, content, 'utf8');
+    if (injection && existsSync(projectFile)) {
+      const content = readFileSync(projectFile, 'utf8');
+      const restored = revertAutoloadEntry(content, injection);
+      writeFileSync(projectFile, restored, 'utf8');
       this.logDebug('Removed interaction server autoload from project.godot');
     }
 
-    // Delete the script file
-    if (existsSync(destScript)) {
+    if (scriptCreatedByUs && existsSync(destScript)) {
       unlinkSync(destScript);
       this.logDebug('Deleted interaction server script from project');
     }
 
-    // Also clean up the .uid file if Godot created one
     const uidFile = destScript + '.uid';
-    if (existsSync(uidFile)) {
+    if (scriptCreatedByUs && existsSync(uidFile)) {
       unlinkSync(uidFile);
       this.logDebug('Deleted interaction server .uid file');
     }
@@ -526,6 +560,34 @@ class GodotServer {
     this.rejectAllPending({ error: 'Disconnected' });
   }
 
+  /**
+   * Reset the TCP bridge after a command timeout. A timed-out asynchronous
+   * GDScript command can leave the injected server busy even though the Godot
+   * process itself is healthy. Reconnecting makes the bridge observe a client
+   * disconnect, clear that state, and accept later semantic commands without
+   * requiring a full project restart.
+   */
+  private async recoverGameConnectionAfterTimeout(command: string): Promise<void> {
+    if (this.gameReconnectPromise) {
+      return this.gameReconnectPromise;
+    }
+
+    const projectPath = this.gameConnection.projectPath;
+    if (!this.activeProcess || !projectPath) {
+      return;
+    }
+
+    this.gameReconnectPromise = (async () => {
+      this.logDebug(`Resetting game interaction connection after '${command}' timeout`);
+      this.disconnectFromGame();
+      await this.connectToGame(projectPath);
+    })().finally(() => {
+      this.gameReconnectPromise = null;
+    });
+
+    return this.gameReconnectPromise;
+  }
+
   private rejectAllPending(response: any): void {
     for (const resolver of this.gameConnection.pendingRequests.values()) {
       resolver(response);
@@ -563,7 +625,9 @@ class GodotServer {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.gameConnection.pendingRequests.delete(id);
-        reject(new Error(`Game command '${command}' timed out after ${timeoutMs / 1000}s`));
+        void this.recoverGameConnectionAfterTimeout(command).finally(() => {
+          reject(new Error(`Game command '${command}' timed out after ${timeoutMs / 1000}s; bridge connection reset`));
+        });
       }, timeoutMs);
 
       this.gameConnection.pendingRequests.set(id, (response: any) => {
@@ -580,15 +644,19 @@ class GodotServer {
    */
   private async cleanup() {
     this.logDebug('Cleaning up resources');
-    this.disconnectFromGame();
-    if (this.gameConnection.projectPath) {
-      this.removeInteractionServer(this.gameConnection.projectPath);
-      this.gameConnection.projectPath = null;
-    }
-    if (this.activeProcess) {
-      this.logDebug('Killing active Godot process');
-      this.activeProcess.process.kill();
-      this.activeProcess = null;
+    try {
+      this.disconnectFromGame();
+      if (this.activeProcess) {
+        this.logDebug('Killing active Godot process');
+        this.activeProcess.process.kill();
+        this.activeProcess = null;
+      }
+      if (this.gameConnection.projectPath) {
+        this.removeInteractionServer(this.gameConnection.projectPath);
+        this.gameConnection.projectPath = null;
+      }
+    } finally {
+      sharedRuntimeLease.release(this.runtimeOwnerId);
     }
     await this.server.close();
   }
@@ -1180,9 +1248,9 @@ class GodotServer {
             required: [],
           },
         },
-{
+        {
           name: 'game_eval',
-          description: 'Execute GDScript in the running game. Use "return" for values.',
+          description: 'Last-resort GDScript; prefer dedicated tools and absolute node paths.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1677,7 +1745,7 @@ class GodotServer {
         // Error/Log capture tools
         {
           name: 'game_get_errors',
-          description: 'Get new push_error/push_warning messages since last call',
+          description: 'Get new categorized error and warning diagnostics since last call',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -3751,31 +3819,48 @@ class GodotServer {
         );
       }
 
-      // Kill any existing process
       if (this.activeProcess) {
-        this.logDebug('Killing existing Godot process before starting a new one');
-        this.disconnectFromGame();
-        if (this.gameConnection.projectPath) {
-          this.removeInteractionServer(this.gameConnection.projectPath);
-        }
-        this.activeProcess.process.kill();
+        return createErrorResponse(
+          'This MCP session already has an active Godot runtime. Stop it before starting another project.'
+        );
+      }
+
+      const leaseResult = sharedRuntimeLease.tryAcquire(this.runtimeOwnerId, args.projectPath);
+      if (!leaseResult.acquired) {
+        return createErrorResponse(
+          `Godot runtime is busy with another MCP session for ${leaseResult.active.projectPath} ` +
+          `(since ${leaseResult.active.acquiredAt}). Stop that runtime before starting ${args.projectPath}.`
+        );
       }
 
       // Inject interaction server before launching
+      this.gameConnection.projectPath = args.projectPath;
       this.injectInteractionServer(args.projectPath);
+      this.lastErrorIndex = 0;
+      this.lastWarningIndex = 0;
+      this.lastLogIndex = 0;
 
-      const cmdArgs = ['-d', '--path', args.projectPath];
+      // Capture stdout/stderr without enabling Godot's interactive CLI
+      // debugger. In an unattended MCP run, a runtime script error under -d
+      // can stop the game at a `debug>` prompt and make every later semantic
+      // command time out even though the process is still alive.
+      const cmdArgs: string[] = [];
+      const displayDriver = resolveGodotDisplayDriver(process.env, process.platform);
+      if (displayDriver) {
+        cmdArgs.push('--display-driver', displayDriver);
+      }
+      cmdArgs.push('--path', args.projectPath);
       if (args.scene && validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
         cmdArgs.push(args.scene);
       }
 
       this.logDebug(`Running Godot project: ${args.projectPath}`);
-      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      const godotProcess = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
       const output: string[] = [];
-      const errors: string[] = [];
+      const stderr: string[] = [];
 
-      process.stdout?.on('data', (data: Buffer) => {
+      godotProcess.stdout?.on('data', (data: Buffer) => {
         const lines = data.toString().split('\n');
         output.push(...lines);
         lines.forEach((line: string) => {
@@ -3783,34 +3868,41 @@ class GodotServer {
         });
       });
 
-      process.stderr?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        errors.push(...lines);
+      godotProcess.stderr?.on('data', (data: Buffer) => {
+        const raw = data.toString();
+        const lines = raw.split('\n');
+        stderr.push(raw);
         lines.forEach((line: string) => {
           if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
         });
       });
 
-      process.on('exit', (code: number | null) => {
+      godotProcess.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
-        this.disconnectFromGame();
-        if (this.gameConnection.projectPath) {
-          this.removeInteractionServer(this.gameConnection.projectPath);
-          this.gameConnection.projectPath = null;
-        }
-        if (this.activeProcess && this.activeProcess.process === process) {
+        if (this.activeProcess && this.activeProcess.process === godotProcess) {
+          this.disconnectFromGame();
+          if (this.gameConnection.projectPath) {
+            this.removeInteractionServer(this.gameConnection.projectPath);
+            this.gameConnection.projectPath = null;
+          }
           this.activeProcess = null;
+          sharedRuntimeLease.release(this.runtimeOwnerId);
         }
       });
 
-      process.on('error', (err: Error) => {
+      godotProcess.on('error', (err: Error) => {
         console.error('Failed to start Godot process:', err);
-        if (this.activeProcess && this.activeProcess.process === process) {
+        if (this.activeProcess && this.activeProcess.process === godotProcess) {
+          if (this.gameConnection.projectPath) {
+            this.removeInteractionServer(this.gameConnection.projectPath);
+            this.gameConnection.projectPath = null;
+          }
           this.activeProcess = null;
+          sharedRuntimeLease.release(this.runtimeOwnerId);
         }
       });
 
-      this.activeProcess = { process, output, errors };
+      this.activeProcess = { process: godotProcess, output, stderr };
 
       // Start async TCP connection to the interaction server (fire-and-forget)
       this.connectToGame(args.projectPath).catch(err => {
@@ -3821,11 +3913,22 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Godot project started in debug mode. Use get_debug_output to see output. Game interaction server connecting on port ${this.INTERACTION_PORT}...`,
+            text: `Godot project started with captured runtime diagnostics. Use get_debug_output to see output. Game interaction server connecting on port ${this.INTERACTION_PORT}...`,
           },
         ],
       };
     } catch (error: unknown) {
+      if (!this.activeProcess) {
+        if (this.gameConnection.projectPath) {
+          try {
+            this.removeInteractionServer(this.gameConnection.projectPath);
+          } catch (cleanupError) {
+            this.logDebug(`Failed to roll back interaction server: ${cleanupError}`);
+          }
+          this.gameConnection.projectPath = null;
+        }
+        sharedRuntimeLease.release(this.runtimeOwnerId);
+      }
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       return createErrorResponse(
         `Failed to run Godot project: ${errorMessage}`
@@ -3843,6 +3946,8 @@ class GodotServer {
       );
     }
 
+    const rawStderr = this.activeProcess.stderr.join('');
+    const diagnostics = classifyGodotStderr(rawStderr);
     return {
       content: [
         {
@@ -3850,7 +3955,9 @@ class GodotServer {
           text: JSON.stringify(
             {
               output: this.activeProcess.output,
-              errors: this.activeProcess.errors,
+              errors: diagnostics.errors,
+              warnings: diagnostics.warnings,
+              stderr: rawStderr.split(/\r?\n/),
             },
             null,
             2
@@ -3874,15 +3981,26 @@ class GodotServer {
     this.disconnectFromGame();
     this.activeProcess.process.kill();
     const output = this.activeProcess.output;
-    const errors = this.activeProcess.errors;
+    const stderr = this.activeProcess.stderr;
+    const rawStderr = stderr.join('');
+    const diagnostics = classifyGodotStderr(rawStderr);
     this.activeProcess = null;
     this.lastErrorIndex = 0;
+    this.lastWarningIndex = 0;
     this.lastLogIndex = 0;
 
-    // Remove injected interaction server
-    if (this.gameConnection.projectPath) {
-      this.removeInteractionServer(this.gameConnection.projectPath);
-      this.gameConnection.projectPath = null;
+    try {
+      if (this.gameConnection.projectPath) {
+        this.removeInteractionServer(this.gameConnection.projectPath);
+        this.gameConnection.projectPath = null;
+      }
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown cleanup error';
+      return createErrorResponse(
+        `Godot process stopped, but MCP project instrumentation cleanup failed: ${errorMessage}`
+      );
+    } finally {
+      sharedRuntimeLease.release(this.runtimeOwnerId);
     }
 
     return {
@@ -3893,7 +4011,9 @@ class GodotServer {
             {
               message: 'Godot project stopped',
               finalOutput: output,
-              finalErrors: errors,
+              finalErrors: diagnostics.errors,
+              finalWarnings: diagnostics.warnings,
+              finalStderr: rawStderr.split(/\r?\n/),
             },
             null,
             2
@@ -4647,7 +4767,28 @@ class GodotServer {
   private async handleGameEval(args: any) {
     args = normalizeParameters(args || {});
     if (!args.code) return createErrorResponse('code parameter is required.');
-    return this.gameCommand('eval', args, a => ({ code: a.code }), 30000);
+    if (!this.activeProcess) return createErrorResponse('No active Godot process. Use run_project first.');
+    if (!this.gameConnection.connected) return createErrorResponse('Not connected to game interaction server.');
+
+    const errorCountBefore = classifyGodotStderr(this.activeProcess.stderr.join('')).errors.length;
+    try {
+      const response = await this.sendGameCommand('eval', { code: args.code }, 30000);
+      if (response.error) return createErrorResponse(`eval failed: ${response.error}`);
+
+      // stderr delivery and the TCP response are separate streams. Give the
+      // process pipe a short bounded turn so a runtime script error is not
+      // reported as a successful null result.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      const errorsAfter = classifyGodotStderr(this.activeProcess?.stderr.join('') || '').errors;
+      const evalErrors = errorsAfter.slice(errorCountBefore);
+      if (evalErrors.length > 0) {
+        return createErrorResponse(`eval produced runtime error:\n${evalErrors.join('\n\n')}`);
+      }
+
+      return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+    } catch (error: any) {
+      return createErrorResponse(`eval failed: ${error?.message || 'Unknown error'}`);
+    }
   }
 
   private async handleGameGetProperty(args: any) {
@@ -5137,9 +5278,22 @@ class GodotServer {
   private async handleGameGetErrors() {
     if (!this.activeProcess)
       return createErrorResponse('No active Godot process. Use run_project first.');
-    const errors = this.activeProcess.errors.slice(this.lastErrorIndex);
-    this.lastErrorIndex = this.activeProcess.errors.length;
-    return { content: [{ type: 'text', text: JSON.stringify({ count: errors.length, errors }, null, 2) }] };
+    const diagnostics = classifyGodotStderr(this.activeProcess.stderr.join(''));
+    const errors = diagnostics.errors.slice(this.lastErrorIndex);
+    const warnings = diagnostics.warnings.slice(this.lastWarningIndex);
+    this.lastErrorIndex = diagnostics.errors.length;
+    this.lastWarningIndex = diagnostics.warnings.length;
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          errorCount: errors.length,
+          errors,
+          warningCount: warnings.length,
+          warnings,
+        }, null, 2),
+      }],
+    };
   }
 
   private async handleGameGetLogs() {
@@ -7062,41 +7216,43 @@ class GodotServer {
     }
   }
 
+  private async prepareForTransport(): Promise<void> {
+    await this.detectGodotPath();
+
+    if (!this.godotPath) {
+      throw new Error(
+        'Failed to find a valid Godot executable path. Set GODOT_PATH or provide godotPath.'
+      );
+    }
+
+    const isValid = await this.isValidGodotPath(this.godotPath);
+    if (!isValid) {
+      if (this.strictPathValidation) {
+        throw new Error(`Invalid Godot path: ${this.godotPath}`);
+      }
+      console.error(`[SERVER] Warning: Using potentially invalid Godot path: ${this.godotPath}`);
+      console.error('[SERVER] This may cause issues when executing Godot commands');
+    }
+
+    console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
+  }
+
+  async connectTransport(transport: any): Promise<void> {
+    await this.prepareForTransport();
+    await this.server.connect(transport);
+  }
+
+  async shutdown(): Promise<void> {
+    await this.cleanup();
+  }
+
   /**
-   * Run the MCP server
+   * Run the original stdio MCP server.
    */
   async run() {
     try {
-      // Detect Godot path before starting the server
-      await this.detectGodotPath();
-
-      if (!this.godotPath) {
-        console.error('[SERVER] Failed to find a valid Godot executable path');
-        console.error('[SERVER] Please set GODOT_PATH environment variable or provide a valid path');
-        process.exit(1);
-      }
-
-      // Check if the path is valid
-      const isValid = await this.isValidGodotPath(this.godotPath);
-
-      if (!isValid) {
-        if (this.strictPathValidation) {
-          // In strict mode, exit if the path is invalid
-          console.error(`[SERVER] Invalid Godot path: ${this.godotPath}`);
-          console.error('[SERVER] Please set a valid GODOT_PATH environment variable or provide a valid path');
-          process.exit(1);
-        } else {
-          // In compatibility mode, warn but continue with the default path
-          console.error(`[SERVER] Warning: Using potentially invalid Godot path: ${this.godotPath}`);
-          console.error('[SERVER] This may cause issues when executing Godot commands');
-          console.error('[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.');
-        }
-      }
-
-      console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
-
       const transport = new StdioServerTransport();
-      await this.server.connect(transport);
+      await this.connectTransport(transport);
       console.error('Godot MCP server running on stdio');
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -7106,10 +7262,217 @@ class GodotServer {
   }
 }
 
-// Create and run the server
-const server = new GodotServer();
-server.run().catch((error: unknown) => {
-  const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-  console.error('Failed to run server:', errorMessage);
+interface HttpSessionRecord {
+  transport: StreamableHTTPServerTransport;
+  godot: GodotServer;
+}
+
+const httpSessions = new Map<string, HttpSessionRecord>();
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const maxBytes = 4 * 1024 * 1024;
+
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > maxBytes) {
+      throw new Error(`HTTP request body exceeds ${maxBytes} bytes`);
+    }
+    chunks.push(buffer);
+  }
+
+  if (chunks.length === 0) return undefined;
+  const raw = Buffer.concat(chunks).toString('utf8');
+  if (raw.trim() === '') return undefined;
+  return JSON.parse(raw);
+}
+
+function writeJson(res: ServerResponse, status: number, value: unknown): void {
+  const body = JSON.stringify(value);
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+async function handleHttpMcpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  mcpPath: string
+): Promise<void> {
+  const requestUrl = new URL(req.url || '/', 'http://localhost');
+
+  if (requestUrl.pathname === '/healthz') {
+    if (req.method !== 'GET') {
+      res.writeHead(405, { allow: 'GET' }).end();
+      return;
+    }
+    writeJson(res, 200, {
+      status: 'ok',
+      transport: 'streamable-http',
+      sessions: httpSessions.size,
+      pid: process.pid,
+    });
+    return;
+  }
+
+  if (requestUrl.pathname !== mcpPath) {
+    writeJson(res, 404, { error: 'not_found' });
+    return;
+  }
+
+  const sessionHeader = req.headers['mcp-session-id'];
+  const sessionId = Array.isArray(sessionHeader) ? sessionHeader[0] : sessionHeader;
+
+  if (req.method === 'POST') {
+    let body: unknown;
+    try {
+      body = await readJsonBody(req);
+    } catch (error: unknown) {
+      writeJson(res, 400, {
+        error: error instanceof Error ? error.message : 'invalid_json',
+      });
+      return;
+    }
+
+    if (sessionId) {
+      const existing = httpSessions.get(sessionId);
+      if (!existing) {
+        writeJson(res, 404, { error: 'unknown_mcp_session' });
+        return;
+      }
+      await existing.transport.handleRequest(req, res, body);
+      return;
+    }
+
+    if (!isInitializeRequest(body)) {
+      writeJson(res, 400, {
+        error: 'MCP initialize request required when mcp-session-id is absent',
+      });
+      return;
+    }
+
+    const godot = new GodotServer({
+      manageProcessSignals: false,
+      godotPath: process.env.GODOT_PATH,
+    });
+
+    let transport: StreamableHTTPServerTransport;
+
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (id: string) => {
+        httpSessions.set(id, { transport, godot });
+      },
+      onsessionclosed: async (id: string) => {
+        const record = httpSessions.get(id);
+        httpSessions.delete(id);
+        if (record) {
+          await record.godot.shutdown();
+        }
+      },
+    });
+
+    await godot.connectTransport(transport);
+    await transport.handleRequest(req, res, body);
+    return;
+  }
+
+  if (req.method === 'GET' || req.method === 'DELETE') {
+    if (!sessionId) {
+      writeJson(res, 400, { error: 'mcp-session-id header required' });
+      return;
+    }
+
+    const existing = httpSessions.get(sessionId);
+    if (!existing) {
+      writeJson(res, 404, { error: 'unknown_mcp_session' });
+      return;
+    }
+
+    await existing.transport.handleRequest(req, res);
+    return;
+  }
+
+  res.writeHead(405, { allow: 'GET, POST, DELETE' }).end();
+}
+
+async function runNativeHttpServer(): Promise<void> {
+  const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
+  const rawPort = process.env.MCP_HTTP_PORT || '9091';
+  const port = Number.parseInt(rawPort, 10);
+  const mcpPath = process.env.MCP_HTTP_PATH || '/mcp';
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid MCP_HTTP_PORT: ${rawPort}`);
+  }
+  if (!mcpPath.startsWith('/')) {
+    throw new Error(`Invalid MCP_HTTP_PATH: ${mcpPath}`);
+  }
+
+  const httpServer = createHttpServer((req, res) => {
+    void handleHttpMcpRequest(req, res, mcpPath).catch((error: unknown) => {
+      console.error('[HTTP MCP Error]', error);
+      if (!res.headersSent) {
+        writeJson(res, 500, {
+          error: error instanceof Error ? error.message : 'internal_error',
+        });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    });
+  });
+
+  const shutdown = async () => {
+    console.error('[SERVER] Native HTTP shutdown requested');
+    for (const record of httpSessions.values()) {
+      try {
+        await record.godot.shutdown();
+      } catch (error) {
+        console.error('[SERVER] Session cleanup failed:', error);
+      }
+    }
+    httpSessions.clear();
+
+    httpServer.close(() => process.exit(0));
+    const timer = setTimeout(() => process.exit(0), 5000);
+    timer.unref();
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    httpServer.once('error', rejectPromise);
+    httpServer.listen(port, host, () => {
+      httpServer.off('error', rejectPromise);
+      console.error(
+        `[SERVER] Godot MCP native Streamable HTTP listening on http://${host}:${port}${mcpPath}`
+      );
+      resolvePromise();
+    });
+  });
+}
+
+const transportMode = (process.env.MCP_TRANSPORT || 'stdio').toLowerCase();
+
+if (transportMode === 'http') {
+  runNativeHttpServer().catch((error: unknown) => {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[SERVER] Native HTTP mode failed:', errorMessage);
+    process.exit(1);
+  });
+} else if (transportMode === 'stdio') {
+  const server = new GodotServer();
+  server.run().catch((error: unknown) => {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('Failed to run server:', errorMessage);
+    process.exit(1);
+  });
+} else {
+  console.error(`[SERVER] Unsupported MCP_TRANSPORT: ${transportMode}`);
   process.exit(1);
-});
+}

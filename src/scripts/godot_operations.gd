@@ -581,6 +581,8 @@ func add_node(params):
     else:
         printerr("Failed to pack scene: " + str(result))
 
+    scene_root.free()
+
 # Load a sprite into a Sprite2D node
 func load_sprite(params):
     print("Loading sprite into scene: " + params.scene_path)
@@ -712,6 +714,8 @@ func load_sprite(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+    scene_root.free()
 
 # Export a scene as a MeshLibrary resource
 func export_mesh_library(params):
@@ -891,6 +895,8 @@ func export_mesh_library(params):
             printerr("Failed to save MeshLibrary: " + str(error))
     else:
         printerr("No valid meshes found in the scene")
+
+    scene_root.free()
 
 # Find files with a specific extension recursively
 func find_files(path, extension):
@@ -1211,6 +1217,11 @@ func save_scene(params):
     else:
         printerr("Failed to pack scene (save_scene): " + str(result))
 
+    # Instantiated Control nodes can own TextServer RIDs. Release the temporary
+    # tree before this short-lived headless process exits so a successful scene
+    # operation does not emit false-positive RID leak errors.
+    scene_root.free()
+
 # Helper: Convert a JSON value to the correct Godot type based on a node's property type
 func _convert_property_value(node, prop_name, value):
     for prop in node.get_property_list():
@@ -1365,7 +1376,7 @@ func read_scene(params):
     print("SCENE_JSON_END")
 
     # Clean up
-    scene_root.queue_free()
+    scene_root.free()
 
 func _walk_scene_tree(node) -> Dictionary:
     var info = {
@@ -1442,6 +1453,7 @@ func modify_node(params):
         target = scene_root.get_node_or_null(node_path)
 
     if target == null:
+        scene_root.free()
         printerr("Node not found: " + params.node_path)
         quit(1)
 
@@ -1457,14 +1469,17 @@ func modify_node(params):
     var packed_scene = PackedScene.new()
     var result = packed_scene.pack(scene_root)
     if result != OK:
+        scene_root.free()
         printerr("Failed to pack scene after modification: " + str(result))
         quit(1)
 
     var save_error = ResourceSaver.save(packed_scene, full_scene_path)
     if save_error != OK:
+        scene_root.free()
         printerr("Failed to save modified scene: " + str(save_error))
         quit(1)
 
+    scene_root.free()
     print("Node modified successfully in: " + full_scene_path)
 
 # Remove a node from a scene file
@@ -1520,6 +1535,7 @@ func remove_node(params):
         printerr("Failed to save scene after removal: " + str(save_error))
         quit(1)
 
+    scene_root.free()
     print("Node '" + removed_name + "' removed successfully from: " + full_scene_path)
 
 # Attach a script to a node in a scene file
@@ -1585,6 +1601,7 @@ func attach_script(params):
         printerr("Failed to save scene after attaching script: " + str(save_error))
         quit(1)
 
+    scene_root.free()
     print("Script '" + full_script_path + "' attached successfully to node in: " + full_scene_path)
 
 # Create a resource file (.tres)
@@ -1858,6 +1875,7 @@ func manage_scene_structure(params):
         printerr("Failed to save scene: " + str(save_error))
         quit(1)
         return
+    root.free()
     print("Scene structure saved: " + full_path)
 
 
