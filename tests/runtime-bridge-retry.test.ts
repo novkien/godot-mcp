@@ -1,6 +1,7 @@
 import { readFileSync } from 'fs';
 import { describe, expect, it } from 'vitest';
 import { retryBridgeConnection } from '../src/runtime-bridge-retry.js';
+import { applyRuntimeBridgeOverlay } from '../scripts/runtime-bridge-source-overlay.js';
 
 describe('retryBridgeConnection', () => {
   it('recovers when the bridge becomes ready after the legacy seven-second window', async () => {
@@ -72,22 +73,32 @@ describe('retryBridgeConnection', () => {
   });
 });
 
-describe('GodotServer runtime bridge integration contract', () => {
-  const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+describe('GodotServer runtime bridge overlay contract', () => {
+  const upstreamSource = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+  const source = applyRuntimeBridgeOverlay(upstreamSource);
 
-  it('uses condition-driven startup and lazy reconnect rather than a permanent disconnected state', () => {
+  it('adds condition-driven startup and lazy reconnect to the pinned upstream source', () => {
     expect(source).toContain("from './runtime-bridge-retry.js'");
     expect(source).toContain('STARTUP_CONNECT_TIMEOUT_MS = 30000');
     expect(source).toContain('LAZY_RECONNECT_TIMEOUT_MS = 5000');
     expect(source).toContain('await this.ensureGameConnection(this.LAZY_RECONNECT_TIMEOUT_MS)');
+    expect(source).toContain('getGameConnectionDiagnostic()');
   });
 
-  it('does not reject generic game commands before lazy reconnect can run', () => {
+  it('removes the permanent disconnected fast-fail before generic game commands can reconnect', () => {
     const start = source.indexOf('private async gameCommand(');
     const end = source.indexOf('private async headlessOp(', start);
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const gameCommandSource = source.slice(start, end);
     expect(gameCommandSource).not.toContain("if (!this.gameConnection.connected) return createErrorResponse('Not connected to game interaction server.')");
+  });
+
+  it('fails closed when upstream markers drift instead of silently building without the fix', () => {
+    const drifted = upstreamSource.replace(
+      "   * Connect to the game's TCP interaction server with retries",
+      "   * Upstream changed this bridge block",
+    );
+    expect(() => applyRuntimeBridgeOverlay(drifted)).toThrow(/connectToGame block markers not found/);
   });
 });
