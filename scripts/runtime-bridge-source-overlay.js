@@ -225,30 +225,61 @@ export function applyRuntimeBridgeOverlay(input) {
     'screenshot pre-reconnect guard',
   );
 
-  source = replaceOnce(
-    source,
-    `      // Kill any existing process\n      if (this.activeProcess) {\n`,
+  const runtimeGenerationMarker = `      // Kill any existing process\n      if (this.activeProcess) {\n`;
+  const hardenedRuntimeGenerationMarker =
+    `      // Inject interaction server before launching\n` +
+    `      this.gameConnection.projectPath = args.projectPath;\n`;
+  const runtimeGenerationPrefix =
     `      // Invalidate any connection attempt owned by an older runtime generation.\n` +
-      `      this.gameConnectionGeneration += 1;\n` +
-      `      this.gameConnectionPromise = null;\n` +
-      `      this.gameConnectionAttempts = 0;\n` +
-      `      this.lastGameConnectionError = null;\n\n` +
-      `      // Kill any existing process\n      if (this.activeProcess) {\n`,
-    'new runtime generation',
-  );
+    `      this.gameConnectionGeneration += 1;\n` +
+    `      this.gameConnectionPromise = null;\n` +
+    `      this.gameConnectionAttempts = 0;\n` +
+    `      this.lastGameConnectionError = null;\n\n`;
+  if (source.includes(runtimeGenerationMarker)) {
+    source = replaceOnce(
+      source,
+      runtimeGenerationMarker,
+      runtimeGenerationPrefix + runtimeGenerationMarker,
+      'new runtime generation',
+    );
+  } else {
+    // The workstation runtime branch rejects an already-active process before
+    // injection, so it has no upstream "Kill any existing process" marker.
+    // Fence the generation immediately before its equivalent injection point.
+    source = replaceOnce(
+      source,
+      hardenedRuntimeGenerationMarker,
+      runtimeGenerationPrefix + hardenedRuntimeGenerationMarker,
+      'new hardened runtime generation',
+    );
+  }
 
-  source = replaceOnce(
-    source,
+  const naturalExitMarker =
     `      process.on('exit', (code: number | null) => {\n` +
-      `        this.logDebug(\`Godot process exited with code \${code}\`);\n` +
-      `        this.disconnectFromGame();\n`,
-    `      process.on('exit', (code: number | null) => {\n` +
-      `        this.logDebug(\`Godot process exited with code \${code}\`);\n` +
-      `        this.gameConnectionGeneration += 1;\n` +
-      `        this.gameConnectionPromise = null;\n` +
-      `        this.disconnectFromGame();\n`,
-    'natural runtime exit invalidation',
-  );
+    `        this.logDebug(\`Godot process exited with code \${code}\`);\n` +
+    `        this.disconnectFromGame();\n`;
+  const hardenedNaturalExitMarker =
+    `      godotProcess.on('exit', (code: number | null) => {\n` +
+    `        this.logDebug(\`Godot process exited with code \${code}\`);\n` +
+    `        if (this.activeProcess && this.activeProcess.process === godotProcess) {\n`;
+  const naturalExitPrefix =
+    `        this.gameConnectionGeneration += 1;\n` +
+    `        this.gameConnectionPromise = null;\n`;
+  if (source.includes(naturalExitMarker)) {
+    source = replaceOnce(
+      source,
+      naturalExitMarker,
+      naturalExitMarker.replace(`        this.disconnectFromGame();\n`, naturalExitPrefix + `        this.disconnectFromGame();\n`),
+      'natural runtime exit invalidation',
+    );
+  } else {
+    source = replaceOnce(
+      source,
+      hardenedNaturalExitMarker,
+      hardenedNaturalExitMarker + naturalExitPrefix,
+      'hardened natural runtime exit invalidation',
+    );
+  }
 
   source = replaceOnce(
     source,
@@ -260,18 +291,33 @@ export function applyRuntimeBridgeOverlay(input) {
     'explicit stop invalidation',
   );
 
-  source = replaceOnce(
-    source,
+  const cleanupMarker =
     `  private async cleanup() {\n` +
-      `    this.logDebug('Cleaning up resources');\n` +
-      `    this.disconnectFromGame();\n`,
+    `    this.logDebug('Cleaning up resources');\n` +
+    `    this.disconnectFromGame();\n`;
+  const hardenedCleanupMarker =
     `  private async cleanup() {\n` +
-      `    this.logDebug('Cleaning up resources');\n` +
-      `    this.gameConnectionGeneration += 1;\n` +
-      `    this.gameConnectionPromise = null;\n` +
-      `    this.disconnectFromGame();\n`,
-    'cleanup invalidation',
-  );
+    `    this.logDebug('Cleaning up resources');\n` +
+    `    try {\n` +
+    `      this.disconnectFromGame();\n`;
+  const cleanupPrefix =
+    `    this.gameConnectionGeneration += 1;\n` +
+    `    this.gameConnectionPromise = null;\n`;
+  if (source.includes(cleanupMarker)) {
+    source = replaceOnce(
+      source,
+      cleanupMarker,
+      cleanupMarker.replace(`    this.disconnectFromGame();\n`, cleanupPrefix + `    this.disconnectFromGame();\n`),
+      'cleanup invalidation',
+    );
+  } else {
+    source = replaceOnce(
+      source,
+      hardenedCleanupMarker,
+      hardenedCleanupMarker.replace(`      this.disconnectFromGame();\n`, cleanupPrefix + `      this.disconnectFromGame();\n`),
+      'hardened cleanup invalidation',
+    );
+  }
 
   return source;
 }
