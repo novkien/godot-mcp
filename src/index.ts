@@ -1184,7 +1184,7 @@ class GodotServer {
         },
         {
           name: 'game_key_press',
-          description: 'Send a key press or input action to the running game',
+          description: 'Send a key event or set a held input action',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1194,11 +1194,11 @@ class GodotServer {
               },
               action: {
                 type: 'string',
-                description: 'Godot input action name (e.g. "move_forward", "ui_accept")',
+                description: 'Action state, held until release; does not emit key events.',
               },
               pressed: {
                 type: 'boolean',
-                description: 'Press (true) or release (false). Default: true (auto-release)',
+                description: 'Default true. Key auto-releases next frame; action needs explicit release.',
               },
             },
             required: [],
@@ -2405,7 +2405,7 @@ class GodotServer {
             properties: {
               nodePath: { type: 'string', description: 'Path to the node' },
               signalName: { type: 'string', description: 'Signal name to await' },
-              timeout: { type: 'number', description: 'Timeout in seconds. Default: 10' },
+              timeout: { type: 'number', description: 'Real-time timeout in seconds, 0 <= timeout < 120. Default: 10' },
             },
             required: ['nodePath', 'signalName'],
           },

@@ -2995,6 +2995,9 @@ func _cmd_await_signal(params: Dictionary) -> void:
 	var node_path: String = params.get("node_path", "")
 	var signal_name: String = params.get("signal_name", "")
 	var timeout: float = float(params.get("timeout", 10))
+	if not is_finite(timeout) or timeout < 0 or timeout >= BUSY_TIMEOUT:
+		_send_response({"error": "Signal timeout must be finite, nonnegative and below %s seconds" % BUSY_TIMEOUT})
+		return
 	var node: Node = get_tree().root.get_node_or_null(node_path)
 	if node == null:
 		_send_response({"error": "Node not found: %s" % node_path})
@@ -3002,17 +3005,49 @@ func _cmd_await_signal(params: Dictionary) -> void:
 	if not node.has_signal(signal_name):
 		_send_response({"error": "Signal not found: %s on %s" % [signal_name, node_path]})
 		return
-	var timer: SceneTreeTimer = get_tree().create_timer(timeout)
+
+	# GDScript callbacks have fixed arity. Generate parameter names from the engine's
+	# argument count only; never interpolate caller-supplied names or source text.
+	var argument_names: PackedStringArray = []
+	for signal_info in node.get_signal_list():
+		if signal_info["name"] == signal_name:
+			for index in signal_info["args"].size():
+				argument_names.append("arg%d" % index)
+			break
+	var arguments: String = ", ".join(argument_names)
+	var callback_script: GDScript = GDScript.new()
+	callback_script.source_code = "extends RefCounted\nvar result: Array\nfunc receive(%s):\n\tresult[0] = true\n\tresult[1] = [%s]\n" % [arguments, arguments]
+	if callback_script.reload() != OK:
+		_send_response({"error": "Could not construct signal callback"})
+		return
 	var result: Array = [false, []]
-	var cb: Callable = func():
-		result[0] = true
-	node.connect(signal_name, cb, CONNECT_ONE_SHOT)
-	while not result[0] and timer.time_left > 0:
+	var receiver: RefCounted = callback_script.new()
+	receiver.set("result", result)
+	var cb: Callable = Callable(receiver, "receive")
+	var connection_error: int = node.connect(signal_name, cb, CONNECT_ONE_SHOT)
+	if connection_error != OK:
+		_send_response({"error": "Could not connect signal: %s" % connection_error})
+		return
+	var request_id: Variant = _current_id
+	var request_client: StreamPeerTCP = _client
+	var deadline: int = Time.get_ticks_msec() + int(timeout * 1000.0)
+	while not result[0] and Time.get_ticks_msec() < deadline and is_instance_valid(node):
+		if _client != request_client or _current_id != request_id:
+			break
+		if request_client != null and request_client.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			break
 		await get_tree().process_frame
-	if node.is_connected(signal_name, cb):
+	if is_instance_valid(node) and node.is_connected(signal_name, cb):
 		node.disconnect(signal_name, cb)
+	# A disconnected/replaced request must not write into a later request or clear its busy flag.
+	if _client != request_client or _current_id != request_id:
+		return
+	if request_client != null and request_client.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+		return
 	if result[0]:
-		_send_response({"success": true, "signal_name": signal_name, "received": true})
+		_send_response({"success": true, "signal_name": signal_name, "received": true, "args": _variant_to_json(result[1])})
+	elif not is_instance_valid(node):
+		_send_response({"error": "Signal source was freed while awaiting: %s" % node_path})
 	else:
 		_send_response({"success": true, "signal_name": signal_name, "received": false, "timeout": true})
 
