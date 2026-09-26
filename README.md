@@ -638,6 +638,23 @@ npm run test:watch  # watch mode
 "Show me the latest error messages from the running game"
 ```
 
+## Runtime input and signal contracts
+
+`game_key_press(key=...)` delivers a key event and releases it after one process
+frame. `game_key_press(action=...)` changes the held Input action state without
+emitting key events; release it with `game_key_release(action=...)` or
+`game_key_press(action=..., pressed=false)`. This distinction is intentional.
+
+`game_await_signal` handles the signal's declared argument count and returns
+`received=true` with ordered, JSON-converted `args` (including `[]` for no arguments).
+A real-time timeout returns `received=false, timeout=true`; missing/freed sources
+and invalid signals return errors. Timeout must be finite, nonnegative and below
+120 seconds. Disconnect/replacement cleans up the callback without replying to a
+later request. This does not replay a timed-out operation.
+
+Run the actual-engine callback regressions as described in
+[tests/godot/README.md](tests/godot/README.md), in addition to `npm test` and `npm run build`.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
